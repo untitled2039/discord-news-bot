@@ -53,6 +53,10 @@ LLM_PROVIDER = os.getenv("LLM_PROVIDER", "gemini").lower()          # gemini | o
 GEMINI_API_KEY = os.getenv("GEMINI_API_KEY", "")
 # 빈 문자열로 넘어와도 기본값을 쓰도록 `or` 사용 (GitHub Variables 미설정 시 "" 전달됨)
 GEMINI_MODEL = os.getenv("GEMINI_MODEL") or "gemini-3.8-flash"
+# 기본 모델이 과부하(503)일 때 차례로 시도할 모델. 비워두면 API에서 사용 가능한 Flash 모델을 자동 탐색
+GEMINI_FALLBACK_MODELS = [m.strip() for m in os.getenv("GEMINI_FALLBACK_MODELS", "").split(",") if m.strip()]
+SUMMARY_BATCH = int(os.getenv("SUMMARY_BATCH", "5"))   # LLM 1회 호출당 기사 수
+LLM_TIME_BUDGET = int(os.getenv("LLM_TIME_BUDGET", "300"))   # 요약 단계 최대 소요 시간(초)
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY", "")
 OPENAI_MODEL = os.getenv("OPENAI_MODEL", "gpt-4o-mini")
 NAVER_CLIENT_ID = os.getenv("NAVER_CLIENT_ID", "")
@@ -81,31 +85,35 @@ CATEGORY_STYLE = {   # 이모지, 임베드 색상
 
 # ─────────────────────────────── 공통 HTTP ───────────────────────────────
 
+class Overloaded(RuntimeError):
+    """재시도를 다 써도 429/5xx/시간 초과가 계속된 경우 (다른 모델로 넘길 신호)."""
+
+
 def http(url: str, data: dict | None = None, headers: dict | None = None,
-         retries: int = 3, timeout: int = 60) -> bytes:
+         retries: int = 3, timeout: int = 60, backoff: float = 2.0) -> bytes:
     body = json.dumps(data).encode() if data is not None else None
     h = {"User-Agent": UA, **(headers or {})}
     if body is not None:
         h.setdefault("Content-Type", "application/json")
+    last = ""
     for attempt in range(1, retries + 1):
+        wait = backoff ** attempt
         try:
             req = urllib.request.Request(url, data=body, headers=h)
             with urllib.request.urlopen(req, timeout=timeout) as r:
                 return r.read()
         except urllib.error.HTTPError as e:
-            # 429/5xx 만 재시도
-            if e.code == 429 or e.code >= 500:
-                wait = float(e.headers.get("Retry-After") or 2 ** attempt)
-                print(f"  ↻ HTTP {e.code}, {wait:.0f}s 후 재시도 ({attempt}/{retries})")
-                time.sleep(wait)
-                continue
-            raise RuntimeError(f"HTTP {e.code}: {e.read()[:1000].decode(errors='ignore')}") from e
+            if not (e.code == 429 or e.code >= 500):   # 4xx 는 재시도해도 소용없음
+                raise RuntimeError(f"HTTP {e.code}: {e.read()[:1000].decode(errors='ignore')}") from e
+            wait = float(e.headers.get("Retry-After") or wait)
+            last = f"HTTP {e.code}"
         except (urllib.error.URLError, TimeoutError) as e:
-            if attempt == retries:
-                raise
-            print(f"  ↻ 네트워크 오류 {e}, 재시도 ({attempt}/{retries})")
-            time.sleep(2 ** attempt)
-    raise RuntimeError(f"요청 실패: {url}")
+            last = f"네트워크 오류 {getattr(e, 'reason', e)}"
+        if attempt < retries:
+            print(f"  ↻ {last}, {wait:.0f}s 후 재시도 ({attempt}/{retries})")
+            time.sleep(wait)
+    # URL 쿼리(키 등)는 로그에 남기지 않음
+    raise Overloaded(f"{last} — {retries}회 시도 실패 ({url.split('?')[0]})")
 
 # ─────────────────────────────── 2단계: 수집 ───────────────────────────────
 
@@ -232,31 +240,79 @@ def build_prompt(articles: list[dict]) -> str:
     return PROMPT.format(cats=", ".join(CATEGORIES), articles="\n".join(lines))
 
 
+GEMINI_BASE = "https://generativelanguage.googleapis.com/v1beta"
+GEMINI_HEADERS = lambda: {"x-goog-api-key": GEMINI_API_KEY}   # 키를 URL 대신 헤더로 (로그 노출 방지)
+
+
 def _gemini_request(model: str, prompt: str) -> str:
-    url = (f"https://generativelanguage.googleapis.com/v1beta/models/"
-           f"{model}:generateContent?key={GEMINI_API_KEY}")
-    res = json.loads(http(url, {
+    res = json.loads(http(f"{GEMINI_BASE}/models/{model}:generateContent", {
         "contents": [{"parts": [{"text": prompt}]}],
         "generationConfig": {"temperature": 0.2, "responseMimeType": "application/json"},
-    }, timeout=120))
+    }, headers=GEMINI_HEADERS(), retries=4, timeout=60, backoff=2.5))   # 대기 2.5→6→16초
     return res["candidates"][0]["content"]["parts"][0]["text"]
 
 
-def call_gemini(prompt: str) -> str:
-    """지원 종료된 모델이면 오류 메시지가 안내하는 새 모델로 자동 재시도."""
-    model = GEMINI_MODEL.removeprefix("models/")
-    print(f"  · 사용 모델: {model}")
+def _version(name: str) -> float:
+    m = re.search(r"gemini-(\d+(?:\.\d+)?)", name)
+    return float(m.group(1)) if m else 0.0
+
+
+def discover_fallbacks(current: str) -> list[str]:
+    """API의 모델 목록에서 텍스트 생성이 되는 Flash 계열을 최신 정식 버전 순으로 2개 고름."""
+    if GEMINI_FALLBACK_MODELS:
+        return [m for m in GEMINI_FALLBACK_MODELS if m != current]
     try:
-        return _gemini_request(model, prompt)
-    except RuntimeError as e:
-        msg = str(e)
-        suggested = [m for m in re.findall(r"models/([\w.\-]+)", msg) if m != model]
-        if ("no longer available" in msg or "not found" in msg.lower()) and suggested:
-            new_model = suggested[0].rstrip(".")
-            print(f"  ⚠ '{model}' 지원 종료 → '{new_model}'(으)로 재시도"
-                  f" (GEMINI_MODEL 설정을 '{new_model}'(으)로 바꿔 두세요)")
-            return _gemini_request(new_model, prompt)
-        raise
+        data = json.loads(http(f"{GEMINI_BASE}/models?pageSize=200",
+                               headers=GEMINI_HEADERS(), retries=2, timeout=20))
+    except Exception as e:
+        print(f"  · 대체 모델 목록 조회 실패: {e}")
+        return []
+    skip = ("image", "tts", "audio", "live", "embedding", "vision", "exp", "thinking")
+    names = []
+    for m in data.get("models", []):
+        name = m.get("name", "").removeprefix("models/")
+        if ("flash" in name and name != current
+                and "generateContent" in m.get("supportedGenerationMethods", [])
+                and not any(s in name for s in skip)):
+            names.append(name)
+    # 정식(non-preview) 우선 → 버전 높은 순 → lite 는 뒤로
+    names.sort(key=lambda n: ("preview" in n, -_version(n), "lite" in n, n))
+    return names[:2]
+
+
+_fallback_cache: list[str] | None = None
+_active_model: str | None = None
+_deadline = float("inf")
+
+
+def call_gemini(prompt: str) -> str:
+    """① 지원 종료 모델 → 안내된 새 모델로 교체  ② 과부하(503/시간 초과) → 대체 모델로 전환."""
+    global _fallback_cache, _active_model
+    model = _active_model or GEMINI_MODEL.removeprefix("models/")
+    tried: list[str] = []
+    while True:
+        tried.append(model)
+        try:
+            text = _gemini_request(model, prompt)
+            _active_model = model            # 다음 묶음은 성공한 모델로 바로 시작
+            return text
+        except Overloaded as e:
+            print(f"  ⚠ '{model}' 응답 없음/과부하: {e}")
+            if _fallback_cache is None:
+                _fallback_cache = discover_fallbacks(model)
+            nxt = next((m for m in _fallback_cache if m not in tried), None)
+            if not nxt or time.monotonic() > _deadline:
+                raise
+        except RuntimeError as e:
+            msg = str(e)
+            suggested = [m.rstrip(".") for m in re.findall(r"models/([\w.\-]+)", msg)
+                         if m.rstrip(".") not in tried]
+            if not (("no longer available" in msg or "not found" in msg.lower()) and suggested):
+                raise
+            nxt = suggested[0]
+            print(f"  ⚠ '{model}' 지원 종료 (GEMINI_MODEL 설정을 '{nxt}'(으)로 바꿔 두세요)")
+        print(f"  → '{nxt}'(으)로 전환")
+        model = nxt
 
 
 def call_openai(prompt: str) -> str:
@@ -283,15 +339,34 @@ def summarize(articles: list[dict]) -> list[dict]:
     print(f"🧠 [3단계] LLM 요약 ({LLM_PROVIDER})")
     results: dict[int, dict] = {}
     if LLM_PROVIDER in ("gemini", "openai") and articles:
-        try:
-            raw = call_gemini(build_prompt(articles)) if LLM_PROVIDER == "gemini" \
-                else call_openai(build_prompt(articles))
-            for r in parse_json_array(raw):
-                if isinstance(r, dict) and 0 <= int(r.get("id", -1)) < len(articles):
-                    results[int(r["id"])] = r
-            print(f"  → {len(results)}/{len(articles)}건 요약 완료")
-        except Exception as e:
-            print(f"  ✗ LLM 요약 실패, 원문 발췌로 대체: {e}")
+        if LLM_PROVIDER == "gemini":
+            print(f"  · 사용 모델: {GEMINI_MODEL}")
+        call = call_gemini if LLM_PROVIDER == "gemini" else call_openai
+        # 작은 묶음으로 나눠 호출 → 응답이 빠르고, 한 묶음이 실패해도 나머지는 요약됨
+        global _deadline
+        _deadline = time.monotonic() + LLM_TIME_BUDGET
+        n_batches = -(-len(articles) // SUMMARY_BATCH)
+        for b in range(n_batches):
+            if time.monotonic() > _deadline:
+                print(f"  ✗ 시간 제한({LLM_TIME_BUDGET}s) 초과 → 남은 {n_batches - b}개 묶음은 발췌문으로 대체")
+                break
+            start = b * SUMMARY_BATCH
+            chunk = articles[start:start + SUMMARY_BATCH]
+            try:
+                got = 0
+                for r in parse_json_array(call(build_prompt(chunk))):
+                    if isinstance(r, dict) and 0 <= int(r.get("id", -1)) < len(chunk):
+                        results[start + int(r["id"])] = r
+                        got += 1
+                print(f"  · 묶음 {b + 1}/{n_batches}: {got}/{len(chunk)}건 요약")
+            except Overloaded as e:
+                print(f"  ✗ 묶음 {b + 1}/{n_batches} 실패: {e}")
+                print(f"  ✗ 사용 가능한 모델이 모두 응답하지 않음 → 남은 기사는 발췌문으로 대체")
+                break
+            except Exception as e:
+                print(f"  ✗ 묶음 {b + 1}/{n_batches} 실패, 원문 발췌로 대체: {e}")
+        print(f"  → {len(results)}/{len(articles)}건 요약 완료"
+              + (f" (최종 모델: {_active_model})" if _active_model else ""))
 
     for i, a in enumerate(articles):
         r = results.get(i, {})
