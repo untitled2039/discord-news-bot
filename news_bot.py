@@ -56,7 +56,9 @@ GEMINI_MODEL = os.getenv("GEMINI_MODEL") or "gemini-3.8-flash"
 # 기본 모델이 과부하(503)일 때 차례로 시도할 모델. 비워두면 API에서 사용 가능한 Flash 모델을 자동 탐색
 GEMINI_FALLBACK_MODELS = [m.strip() for m in os.getenv("GEMINI_FALLBACK_MODELS", "").split(",") if m.strip()]
 SUMMARY_BATCH = int(os.getenv("SUMMARY_BATCH", "5"))   # LLM 1회 호출당 기사 수
-LLM_TIME_BUDGET = int(os.getenv("LLM_TIME_BUDGET", "300"))   # 요약 단계 최대 소요 시간(초)
+# 추론(thinking) 강도: low(기본, 빠름) | default(모델 기본값). 요약엔 깊은 추론이 필요 없음
+GEMINI_THINKING = (os.getenv("GEMINI_THINKING") or "low").lower()
+LLM_TIME_BUDGET = int(os.getenv("LLM_TIME_BUDGET", "420"))   # 요약 단계 최대 소요 시간(초)
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY", "")
 OPENAI_MODEL = os.getenv("OPENAI_MODEL", "gpt-4o-mini")
 NAVER_CLIENT_ID = os.getenv("NAVER_CLIENT_ID", "")
@@ -90,12 +92,15 @@ class Overloaded(RuntimeError):
 
 
 def http(url: str, data: dict | None = None, headers: dict | None = None,
-         retries: int = 3, timeout: int = 60, backoff: float = 2.0) -> bytes:
+         retries: int = 3, timeout: int = 60, backoff: float = 2.0,
+         max_timeouts: int | None = None) -> bytes:
+    """429/5xx/네트워크 오류는 재시도. max_timeouts 를 주면 시간 초과는 그 횟수까지만 시도
+    (응답이 느린 모델에 같은 요청을 반복해 봐야 시간만 낭비되므로)."""
     body = json.dumps(data).encode() if data is not None else None
     h = {"User-Agent": UA, **(headers or {})}
     if body is not None:
         h.setdefault("Content-Type", "application/json")
-    last = ""
+    last, timeouts = "", 0
     for attempt in range(1, retries + 1):
         wait = backoff ** attempt
         try:
@@ -108,7 +113,14 @@ def http(url: str, data: dict | None = None, headers: dict | None = None,
             wait = float(e.headers.get("Retry-After") or wait)
             last = f"HTTP {e.code}"
         except (urllib.error.URLError, TimeoutError) as e:
-            last = f"네트워크 오류 {getattr(e, 'reason', e)}"
+            reason = getattr(e, "reason", e)
+            last = f"네트워크 오류 {reason}"
+            if "timed out" in str(reason):
+                timeouts += 1
+                last = f"{timeout}s 안에 응답 없음"
+                if max_timeouts is not None and timeouts >= max_timeouts:
+                    raise Overloaded(f"{last} ({timeouts}회)") from e
+                wait = 1
         if attempt < retries:
             print(f"  ↻ {last}, {wait:.0f}s 후 재시도 ({attempt}/{retries})")
             time.sleep(wait)
@@ -244,12 +256,40 @@ GEMINI_BASE = "https://generativelanguage.googleapis.com/v1beta"
 GEMINI_HEADERS = lambda: {"x-goog-api-key": GEMINI_API_KEY}   # 키를 URL 대신 헤더로 (로그 노출 방지)
 
 
+_thinking_supported = True
+
+
+def _thinking_config(model: str) -> dict | None:
+    """Gemini 3 이상은 thinkingLevel, 2.x 는 thinkingBudget 으로 추론을 줄임."""
+    if GEMINI_THINKING == "default" or not _thinking_supported:
+        return None
+    if _version(model) >= 3:
+        return {"thinkingLevel": "low"}
+    return {"thinkingBudget": 0} if "lite" not in model else None
+
+
 def _gemini_request(model: str, prompt: str) -> str:
-    res = json.loads(http(f"{GEMINI_BASE}/models/{model}:generateContent", {
-        "contents": [{"parts": [{"text": prompt}]}],
-        "generationConfig": {"temperature": 0.2, "responseMimeType": "application/json"},
-    }, headers=GEMINI_HEADERS(), retries=4, timeout=60, backoff=2.5))   # 대기 2.5→6→16초
-    return res["candidates"][0]["content"]["parts"][0]["text"]
+    global _thinking_supported
+    cfg = {"temperature": 0.2, "responseMimeType": "application/json"}
+    tc = _thinking_config(model)
+    if tc:
+        cfg["thinkingConfig"] = tc
+    t0 = time.monotonic()
+    try:
+        raw = http(f"{GEMINI_BASE}/models/{model}:generateContent",
+                   {"contents": [{"parts": [{"text": prompt}]}], "generationConfig": cfg},
+                   headers=GEMINI_HEADERS(), retries=4, timeout=90, backoff=2.5,   # 503 대기 2.5→6→16초
+                   max_timeouts=2)                                                  # 시간 초과는 1회만 재시도
+    except RuntimeError as e:
+        if tc and not isinstance(e, Overloaded) and "HTTP 400" in str(e) and "thinking" in str(e).lower():
+            print("  · 이 모델은 thinkingConfig 미지원 → 옵션 없이 재요청")
+            _thinking_supported = False
+            return _gemini_request(model, prompt)
+        raise
+    res = json.loads(raw)
+    print(f"  · {model} 응답 {time.monotonic() - t0:.0f}s")
+    parts = res["candidates"][0]["content"]["parts"]
+    return "".join(p.get("text", "") for p in parts if not p.get("thought"))
 
 
 def _version(name: str) -> float:
@@ -258,7 +298,7 @@ def _version(name: str) -> float:
 
 
 def discover_fallbacks(current: str) -> list[str]:
-    """API의 모델 목록에서 텍스트 생성이 되는 Flash 계열을 최신 정식 버전 순으로 2개 고름."""
+    """API의 모델 목록에서 텍스트 생성이 되는 Flash 계열을 골라 최대 3개 반환 (lite 우선)."""
     if GEMINI_FALLBACK_MODELS:
         return [m for m in GEMINI_FALLBACK_MODELS if m != current]
     try:
@@ -275,9 +315,9 @@ def discover_fallbacks(current: str) -> list[str]:
                 and "generateContent" in m.get("supportedGenerationMethods", [])
                 and not any(s in name for s in skip)):
             names.append(name)
-    # 정식(non-preview) 우선 → 버전 높은 순 → lite 는 뒤로
-    names.sort(key=lambda n: ("preview" in n, -_version(n), "lite" in n, n))
-    return names[:2]
+    # 정식(non-preview) 우선 → 가볍고 빠른 lite 우선 → 버전 높은 순
+    names.sort(key=lambda n: ("preview" in n, "lite" not in n, -_version(n), n))
+    return names[:3]
 
 
 _fallback_cache: list[str] | None = None
