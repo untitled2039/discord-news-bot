@@ -99,7 +99,7 @@ def http(url: str, data: dict | None = None, headers: dict | None = None,
                 print(f"  ↻ HTTP {e.code}, {wait:.0f}s 후 재시도 ({attempt}/{retries})")
                 time.sleep(wait)
                 continue
-            raise RuntimeError(f"HTTP {e.code}: {e.read()[:300].decode(errors='ignore')}") from e
+            raise RuntimeError(f"HTTP {e.code}: {e.read()[:1000].decode(errors='ignore')}") from e
         except (urllib.error.URLError, TimeoutError) as e:
             if attempt == retries:
                 raise
@@ -232,14 +232,31 @@ def build_prompt(articles: list[dict]) -> str:
     return PROMPT.format(cats=", ".join(CATEGORIES), articles="\n".join(lines))
 
 
-def call_gemini(prompt: str) -> str:
+def _gemini_request(model: str, prompt: str) -> str:
     url = (f"https://generativelanguage.googleapis.com/v1beta/models/"
-           f"{GEMINI_MODEL}:generateContent?key={GEMINI_API_KEY}")
+           f"{model}:generateContent?key={GEMINI_API_KEY}")
     res = json.loads(http(url, {
         "contents": [{"parts": [{"text": prompt}]}],
         "generationConfig": {"temperature": 0.2, "responseMimeType": "application/json"},
     }, timeout=120))
     return res["candidates"][0]["content"]["parts"][0]["text"]
+
+
+def call_gemini(prompt: str) -> str:
+    """지원 종료된 모델이면 오류 메시지가 안내하는 새 모델로 자동 재시도."""
+    model = GEMINI_MODEL.removeprefix("models/")
+    print(f"  · 사용 모델: {model}")
+    try:
+        return _gemini_request(model, prompt)
+    except RuntimeError as e:
+        msg = str(e)
+        suggested = [m for m in re.findall(r"models/([\w.\-]+)", msg) if m != model]
+        if ("no longer available" in msg or "not found" in msg.lower()) and suggested:
+            new_model = suggested[0].rstrip(".")
+            print(f"  ⚠ '{model}' 지원 종료 → '{new_model}'(으)로 재시도"
+                  f" (GEMINI_MODEL 설정을 '{new_model}'(으)로 바꿔 두세요)")
+            return _gemini_request(new_model, prompt)
+        raise
 
 
 def call_openai(prompt: str) -> str:
