@@ -42,6 +42,7 @@ def load_dotenv(path: str = ".env") -> None:
             if not line or line.startswith("#") or "=" not in line:
                 continue
             k, v = line.split("=", 1)
+            v = re.split(r"\s+#", v, maxsplit=1)[0]   # 줄 끝 주석 제거
             os.environ.setdefault(k.strip(), v.strip().strip('"').strip("'"))
 
 
@@ -50,7 +51,8 @@ load_dotenv()
 DISCORD_WEBHOOK_URL = os.getenv("DISCORD_WEBHOOK_URL", "")
 LLM_PROVIDER = os.getenv("LLM_PROVIDER", "gemini").lower()          # gemini | openai | none
 GEMINI_API_KEY = os.getenv("GEMINI_API_KEY", "")
-GEMINI_MODEL = os.getenv("GEMINI_MODEL", "gemini-2.5-flash")
+# 빈 문자열로 넘어와도 기본값을 쓰도록 `or` 사용 (GitHub Variables 미설정 시 "" 전달됨)
+GEMINI_MODEL = os.getenv("GEMINI_MODEL") or "gemini-3.8-flash"
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY", "")
 OPENAI_MODEL = os.getenv("OPENAI_MODEL", "gpt-4o-mini")
 NAVER_CLIENT_ID = os.getenv("NAVER_CLIENT_ID", "")
