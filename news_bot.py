@@ -66,6 +66,20 @@ NAVER_CLIENT_SECRET = os.getenv("NAVER_CLIENT_SECRET", "")
 NAVER_QUERIES = [q.strip() for q in os.getenv("NAVER_QUERIES", "").split(",") if q.strip()]
 PER_SECTION = int(os.getenv("ARTICLES_PER_SECTION", "3"))
 MAX_AGE_HOURS = int(os.getenv("MAX_AGE_HOURS", "24"))
+# 전송 기록: 최근 N일 안에 보낸 기사(같은 링크 또는 유사 제목)는 다시 보내지 않음
+SENT_HISTORY_FILE = os.getenv("SENT_HISTORY_FILE") or "data/sent_history.json"
+HISTORY_DAYS = int(os.getenv("HISTORY_DAYS") or "3")
+BRIEFING = (os.getenv("BRIEFING") or "on").lower() != "off"   # 오늘의 한 줄 브리핑 on/off
+# 문장 임베딩 (중복 제거 + RAG 검색에 사용). 실패하면 자동으로 2-gram 방식만 사용
+DEDUP_MODE = (os.getenv("DEDUP_MODE") or "embedding").lower()       # embedding | bigram
+GEMINI_EMBED_MODEL = os.getenv("GEMINI_EMBED_MODEL") or "gemini-embedding-001"
+EMBED_DIM = int(os.getenv("EMBED_DIM") or "256")                     # 벡터 차원 (기록 파일 크기 절약)
+EMBED_DUP_THRESHOLD = float(os.getenv("EMBED_DUP_THRESHOLD") or "0.88")   # 이 이상이면 같은 사건
+RAG_THRESHOLD = float(os.getenv("RAG_THRESHOLD") or "0.72")              # 이 이상이면 관련 과거 기사
+RAG_TOP_K = int(os.getenv("RAG_TOP_K") or "3")
+EMBED_PER_SECTION = 15   # 분야별 상위 몇 개까지 임베딩할지 (API 호출량 제한)
+# 요약 프롬프트 방식: fewshot(예시 2개 포함, 기본) | zeroshot
+PROMPT_MODE = (os.getenv("PROMPT_MODE") or "fewshot").lower()
 
 # 구글 뉴스 한국판 분야별 RSS (토픽 ID는 구글 뉴스 공식 섹션)
 GN = "https://news.google.com/rss"
@@ -196,7 +210,107 @@ def is_dup(t: str, seen: list[str], threshold: float = 0.55) -> bool:
     return False
 
 
-def collect() -> list[dict]:
+# ─────────────────────────────── 문장 임베딩 ───────────────────────────────
+# 제목을 의미 벡터로 바꿔 코사인 유사도로 비교한다.
+#  · 2-gram 은 글자가 겹쳐야 같다고 보지만("기준금리 동결" ≈ "기준금리 3.0% 동결"),
+#    임베딩은 표현이 달라도 뜻이 같으면 가깝게 나온다("기준금리 동결" ≈ "금리 묶었다").
+
+def _unit(v: list[float]) -> list[float]:
+    n = sum(x * x for x in v) ** 0.5 or 1.0
+    return [x / n for x in v]
+
+
+def cosine(a: list[float], b: list[float]) -> float:
+    return sum(x * y for x, y in zip(a, b))   # 정규화된 벡터끼리는 내적 = 코사인 유사도
+
+
+_embed_model: str | None = None
+_embed_dim_ok = True
+
+
+def _embed_request(model: str, texts: list[str]) -> list[list[float]]:
+    reqs = []
+    for t in texts:
+        r = {"model": f"models/{model}", "content": {"parts": [{"text": t}]},
+             "taskType": "SEMANTIC_SIMILARITY"}
+        if _embed_dim_ok:
+            r["outputDimensionality"] = EMBED_DIM
+        reqs.append(r)
+    res = json.loads(http(f"{GEMINI_BASE}/models/{model}:batchEmbedContents", {"requests": reqs},
+                          headers=GEMINI_HEADERS(), retries=3, timeout=30))
+    return [_unit(e["values"]) for e in res["embeddings"]]
+
+
+def _discover_embed_model() -> str | None:
+    data = json.loads(http(f"{GEMINI_BASE}/models?pageSize=200", headers=GEMINI_HEADERS(),
+                           retries=2, timeout=20))
+    names = [m["name"].removeprefix("models/") for m in data.get("models", [])
+             if "embedContent" in m.get("supportedGenerationMethods", [])]
+    names.sort(key=lambda n: ("gemini" not in n, "exp" in n or "preview" in n, n))
+    return names[0] if names else None
+
+
+def embed(texts: list[str]) -> list[list[float]] | None:
+    """여러 문장을 임베딩. 사용할 수 없으면 None (→ 2-gram 방식만 사용)."""
+    global _embed_model, _embed_dim_ok
+    if DEDUP_MODE != "embedding" or not GEMINI_API_KEY or not texts:
+        return None
+    model = _embed_model or GEMINI_EMBED_MODEL
+    out: list[list[float]] = []
+    try:
+        for i in range(0, len(texts), 100):            # 요청당 최대 100개
+            chunk = texts[i:i + 100]
+            try:
+                out += _embed_request(model, chunk)
+            except RuntimeError as e:
+                msg = str(e)
+                if isinstance(e, Overloaded) or "HTTP 4" not in msg:
+                    raise
+                if _embed_dim_ok and "imensionality" in msg:      # 차원 지정 미지원 모델
+                    _embed_dim_ok = False
+                elif "not found" in msg.lower() or "no longer available" in msg:
+                    new = _discover_embed_model()
+                    if not new or new == model:
+                        raise
+                    print(f"  ⚠ 임베딩 모델 '{model}' 사용 불가 → '{new}'(으)로 전환")
+                    model = new
+                else:
+                    raise
+                out += _embed_request(model, chunk)
+        _embed_model = model
+        return out
+    except Exception as e:
+        print(f"  ✗ 임베딩 실패 → 2-gram 방식으로만 중복 제거: {e}")
+        return None
+
+
+def load_history() -> list[dict]:
+    """최근 HISTORY_DAYS 일 안에 보낸 기사 목록. 파일이 없거나 깨져 있으면 빈 목록."""
+    try:
+        with open(SENT_HISTORY_FILE, encoding="utf-8") as f:
+            items = json.load(f).get("items", [])
+    except (OSError, ValueError, AttributeError):
+        return []
+    cutoff = (datetime.now(KST) - timedelta(days=HISTORY_DAYS)).strftime("%Y-%m-%d")
+    return [it for it in items if isinstance(it, dict) and it.get("date", "") >= cutoff]
+
+
+def save_history(history: list[dict], sent: list[dict]) -> None:
+    today = datetime.now(KST).strftime("%Y-%m-%d")
+    items = history + [{
+        "date": today, "title": a["title"], "link": a["link"],
+        "category": a.get("category", ""),
+        # LLM 요약이 성공한 기사만 요약을 저장 (RAG 검색 시 맥락으로 사용)
+        "summary": a["summary"] if a.get("summarized") else [],
+        "vec": [round(x, 4) for x in a["vec"]] if a.get("vec") else None,
+    } for a in sent]
+    os.makedirs(os.path.dirname(SENT_HISTORY_FILE) or ".", exist_ok=True)
+    with open(SENT_HISTORY_FILE, "w", encoding="utf-8") as f:
+        json.dump({"updated": today, "items": items}, f, ensure_ascii=False, indent=1)
+    print(f"  · 전송 기록 저장: {SENT_HISTORY_FILE} (최근 {HISTORY_DAYS}일, {len(items)}건)")
+
+
+def collect(history: list[dict] | None = None) -> list[dict]:
     print("📥 [2단계] 뉴스 수집")
     pools: list[tuple[str, list[dict]]] = []
     for sec, url in SECTIONS.items():
@@ -215,21 +329,63 @@ def collect() -> list[dict]:
             except Exception as e:
                 print(f"  ✗ 네이버 '{q}' 실패: {e}")
 
-    # 분야별 상위 N개 선택 + 전체 기준 중복(유사 제목) 제거
+    # 분야별 상위 후보를 한 번에 임베딩 (실패하면 vecs=None → 2-gram 만 사용)
+    candidates = [a for _, items in pools for a in items[:EMBED_PER_SECTION]]
+    vecs = embed([a["title"] for a in candidates])
+    if vecs:
+        for a, v in zip(candidates, vecs):
+            a["vec"] = v
+        print(f"  · 제목 {len(vecs)}건 임베딩 ({_embed_model}, {len(vecs[0])}차원)")
+
+    def embed_dup(a: dict, others: list[dict]) -> tuple[float, dict] | None:
+        """임베딩 코사인 유사도가 임계값 이상인 기사 중 가장 비슷한 것."""
+        if not a.get("vec"):
+            return None
+        best = max(((cosine(a["vec"], o["vec"]), o) for o in others if o.get("vec")),
+                   key=lambda x: x[0], default=None)
+        return best if best and best[0] >= EMBED_DUP_THRESHOLD else None
+
+    # 분야별 상위 N개 선택 + 전체 기준 중복 제거
+    # + 최근 며칠 안에 이미 보낸 기사(같은 링크 또는 유사 제목)도 제외
+    # 중복 판별 = 2-gram 자카드(글자 기준) OR 임베딩 코사인(의미 기준)
+    history = history or []
+    sent_links = {h.get("link") for h in history}
+    sent_keys = [norm(h.get("title", "")) for h in history]
     seen: list[str] = []
     picked: list[dict] = []
+    stats = {"bigram": 0, "embedding": 0, "already": 0}
     for _, items in pools:
         n = 0
         for a in items:
             key = norm(a["title"])
-            if not key or is_dup(key, seen):
+            if not key:
+                continue
+            if is_dup(key, seen):
+                stats["bigram"] += 1
+                continue
+            if a["link"] in sent_links or is_dup(key, sent_keys):
+                stats["already"] += 1
+                continue
+            hit = embed_dup(a, picked)
+            if hit:
+                stats["embedding"] += 1
+                print(f"  ≈ 의미 중복({hit[0]:.2f}): '{a['title'][:30]}' ~ '{hit[1]['title'][:30]}'")
+                continue
+            hit = embed_dup(a, history)
+            if hit:
+                stats["already"] += 1
+                print(f"  ≈ 이미 보낸 기사와 의미 중복({hit[0]:.2f}): '{a['title'][:30]}'")
                 continue
             seen.append(key)
             picked.append(a)
             n += 1
             if n >= PER_SECTION:
                 break
-    print(f"  → 중복 제거 후 {len(picked)}건 선정")
+    print(f"  · 중복 제거: 2-gram {stats['bigram']}건"
+          + (f", 임베딩 추가 {stats['embedding']}건" if vecs else " (임베딩 미사용)"))
+    if history:
+        print(f"  · 최근 {HISTORY_DAYS}일 내 이미 보낸 기사 {stats['already']}건 제외")
+    print(f"  → 최종 {len(picked)}건 선정")
     return picked
 
 # ─────────────────────────────── 3단계: LLM 요약 ───────────────────────────────
@@ -241,15 +397,28 @@ PROMPT = """너는 한국어 뉴스 에디터다. 아래 기사 목록의 각 �
 
 반드시 아래 JSON 배열만 출력하라 (코드블록·설명 금지):
 [{{"id": 0, "category": "경제", "summary": ["첫째 줄", "둘째 줄", "셋째 줄"]}}, ...]
-
+{examples}
 기사 목록:
 {articles}"""
+
+# Few-shot 예시 (In-Context Learning)
+#  · 문체(~했다 체, 40자 안팎)와 "발췌문에 있는 내용만 쓰기"를 예시로 보여 준다.
+#  · 헷갈리기 쉬운 분류 경계를 예시로 고정한다: 국회 입법 → 정치 / 부동산 시세 → 경제(사회 아님)
+#  · 예시는 실제 뉴스가 아닌 가상의 기사이며, 출력에 섞이지 않도록 별도 표기한다.
+FEW_SHOT_EXAMPLES = """
+아래는 작성 예시다 (가상의 기사이며, 예시 내용을 출력에 포함하지 말 것).
+예시 입력 A) 제목: 국회, 플랫폼 노동자 보호법 본회의 통과 | 언론사: 예시일보 | 발췌: 국회는 12일 본회의에서 배달·대리운전 등 플랫폼 노동자에게 산재보험을 의무 적용하는 법안을 재석 250명 중 231명 찬성으로 가결했다. 시행은 공포 후 1년 뒤다.
+예시 출력 A) {"category": "정치", "summary": ["국회가 플랫폼 노동자 보호법을 본회의에서 가결했다.", "배달·대리운전 노동자도 산재보험을 의무 적용받는다.", "법은 공포 1년 뒤부터 시행된다."]}
+예시 입력 B) 제목: 수도권 아파트 전셋값 12주 연속 상승 | 언론사: 예시경제 | 발췌: 한국부동산원에 따르면 이번 주 수도권 아파트 전셋값은 0.1% 올라 12주 연속 상승했다. 전세 매물 부족이 주된 원인으로 꼽힌다.
+예시 출력 B) {"category": "경제", "summary": ["수도권 아파트 전셋값이 12주 연속 올랐다.", "이번 주 상승률은 0.1%로 집계됐다.", "전세 매물 부족이 주된 원인으로 꼽힌다."]}
+"""
 
 
 def build_prompt(articles: list[dict]) -> str:
     lines = [f'[{i}] 제목: {a["title"]} | 언론사: {a["source"]} | 발췌: {a["desc"]}'
              for i, a in enumerate(articles)]
-    return PROMPT.format(cats=", ".join(CATEGORIES), articles="\n".join(lines))
+    examples = FEW_SHOT_EXAMPLES if PROMPT_MODE == "fewshot" else ""
+    return PROMPT.format(cats=", ".join(CATEGORIES), articles="\n".join(lines), examples=examples)
 
 
 GEMINI_BASE = "https://generativelanguage.googleapis.com/v1beta"
@@ -376,7 +545,7 @@ def guess_category(a: dict) -> str:
 
 
 def summarize(articles: list[dict]) -> list[dict]:
-    print(f"🧠 [3단계] LLM 요약 ({LLM_PROVIDER})")
+    print(f"🧠 [3단계] LLM 요약 ({LLM_PROVIDER}, {'Few-shot' if PROMPT_MODE == 'fewshot' else 'Zero-shot'})")
     results: dict[int, dict] = {}
     if LLM_PROVIDER in ("gemini", "openai") and articles:
         if LLM_PROVIDER == "gemini":
@@ -415,7 +584,94 @@ def summarize(articles: list[dict]) -> list[dict]:
         if not summary:  # 폴백: 발췌문 사용
             summary = [a["desc"][:120] or a["title"]]
         a["category"], a["summary"] = cat, summary
+        a["summarized"] = bool(r.get("summary"))   # LLM 요약 성공 여부 (브리핑 생성에 사용)
     return articles
+
+
+BRIEFING_PROMPT = """너는 한국어 뉴스 에디터다. 아래는 오늘의 주요 뉴스 요약이다.
+독자가 오늘 하루 뉴스의 흐름을 한눈에 파악할 수 있도록 가장 중요한 이슈 2~3개를 골라
+2~3문장(전체 150자 안팎)으로 브리핑하라. 주어진 내용에 없는 사실·수치는 추가하지 말 것.
+
+반드시 아래 JSON만 출력하라 (코드블록·설명 금지):
+{{"briefing": "브리핑 문장"}}
+
+오늘의 뉴스:
+{articles}
+{context}"""
+
+# RAG: 전송 기록에서 검색한 관련 과거 기사를 브리핑 프롬프트에 덧붙이는 부분
+RAG_CONTEXT = """
+참고 자료 — 최근 며칠간 이미 전한 관련 뉴스:
+{items}
+브리핑의 중심은 오늘의 뉴스다. 참고 자료가 오늘 뉴스와 직접 이어지는 경우에만
+"어제 ~에 이어"처럼 흐름을 짧게 연결하고, 참고 자료만의 내용을 따로 소개하지는 말 것."""
+
+
+def retrieve_context(articles: list[dict], history: list[dict]) -> list[tuple[float, dict, dict]]:
+    """RAG 검색 단계: 오늘 기사와 의미가 가까운 과거 기사를 전송 기록에서 찾는다.
+    반환: [(유사도, 과거 기사, 오늘 기사)] 유사도 높은 순, 최대 RAG_TOP_K 건."""
+    kb = [h for h in history if h.get("vec") and h.get("summary")]
+    pairs = []
+    for a in articles:
+        if not (a.get("vec") and a.get("summarized")):
+            continue
+        for h in kb:
+            score = cosine(a["vec"], h["vec"])
+            if score >= RAG_THRESHOLD:
+                pairs.append((score, h, a))
+    pairs.sort(key=lambda x: -x[0])
+    out, used = [], set()
+    for score, h, a in pairs:
+        if h["link"] not in used:
+            used.add(h["link"])
+            out.append((score, h, a))
+        if len(out) >= RAG_TOP_K:
+            break
+    return out
+
+
+def _day_label(date: str) -> str:
+    today = datetime.now(KST).date()
+    try:
+        d = datetime.strptime(date, "%Y-%m-%d").date()
+    except ValueError:
+        return date
+    rel = {1: "어제", 2: "그저께"}.get((today - d).days, "")
+    return f"{d.month}월 {d.day}일" + (f", {rel}" if rel else "")
+
+
+def make_briefing(articles: list[dict], history: list[dict] | None = None) -> str:
+    """오늘의 한 줄 브리핑. 요약된 기사가 없거나 실패·시간 초과면 빈 문자열(브리핑 생략)."""
+    done = [a for a in articles if a.get("summarized")]
+    if not BRIEFING or LLM_PROVIDER not in ("gemini", "openai") or not done:
+        return ""
+    if time.monotonic() > _deadline:
+        print("  · 시간 제한 초과로 브리핑 생략")
+        return ""
+    lines = [f'- [{a["category"]}] {a["title"]}: {" ".join(a["summary"])}' for a in done]
+
+    # RAG: 검색(Retrieve) → 프롬프트에 덧붙이기(Augment) → 생성(Generate)
+    context = ""
+    related = retrieve_context(done, history or [])
+    if related:
+        items = []
+        for score, h, a in related:
+            print(f"  · RAG 관련 과거 기사({score:.2f}): '{h['title'][:28]}' ↔ 오늘 '{a['title'][:28]}'")
+            items.append(f'- ({_day_label(h["date"])}, {h.get("category", "")}) '
+                         f'{h["title"]}: {" ".join(h["summary"])}')
+        context = RAG_CONTEXT.format(items="\n".join(items))
+    try:
+        call = call_gemini if LLM_PROVIDER == "gemini" else call_openai
+        text = call(BRIEFING_PROMPT.format(articles="\n".join(lines), context=context))
+        text = re.sub(r"^```(?:json)?|```$", "", text.strip(), flags=re.M).strip()
+        data = json.loads(text[text.find("{"): text.rfind("}") + 1])
+        briefing = str(data.get("briefing", "")).strip()
+        print(f"  · 오늘의 브리핑 생성 ({len(briefing)}자"
+              + (f", 과거 기사 {len(related)}건 참고)" if related else ")"))
+        return briefing[:600]
+    except Exception as e:
+        print(f"  ✗ 브리핑 생성 실패, 생략: {e}")
+        return ""
 
 # ─────────────────────────────── 4단계: 디스코드 전송 ───────────────────────────────
 
@@ -441,11 +697,14 @@ def build_embeds(articles: list[dict]) -> list[dict]:
     return embeds
 
 
-def send_discord(articles: list[dict]) -> None:
+def send_discord(articles: list[dict], briefing: str = "") -> bool:
+    """디스코드로 전송했으면 True, 웹훅 미설정(콘솔 출력만)이면 False."""
     print("📤 [4단계] 디스코드 전송")
     today = datetime.now(KST)
     weekday = "월화수목금토일"[today.weekday()]
     header = f"## 🗞️ {today:%Y년 %m월 %d일} ({weekday}) 오늘의 주요 뉴스\n총 {len(articles)}건 · 3줄 요약"
+    if briefing:
+        header += f"\n\n**📌 오늘의 브리핑**\n> {briefing}"
 
     embeds = build_embeds(articles)
     # 메시지당 임베드 10개, 총 6000자 한도 → 나눠 보내기
@@ -465,7 +724,7 @@ def send_discord(articles: list[dict]) -> None:
         print(header)
         for e in embeds:
             print(f"\n{e['title']}\n{e['description']}")
-        return
+        return False
 
     for i, batch in enumerate(batches or [[]]):
         payload = {"username": "데일리 뉴스봇", "embeds": batch}
@@ -474,18 +733,23 @@ def send_discord(articles: list[dict]) -> None:
         http(DISCORD_WEBHOOK_URL, payload)
         time.sleep(1)
     print(f"  → {len(batches)}개 메시지 전송 완료")
+    return True
 
 # ─────────────────────────────── 실행 ───────────────────────────────
 
 def main() -> int:
     print(f"⏰ [1단계] 실행 시작 {datetime.now(KST):%Y-%m-%d %H:%M} KST")
-    articles = collect()
+    history = load_history()
+    articles = collect(history)
     if not articles:
         print("수집된 기사가 없습니다.")
         if DISCORD_WEBHOOK_URL:
-            http(DISCORD_WEBHOOK_URL, {"content": "⚠️ 오늘은 뉴스를 수집하지 못했습니다."})
+            http(DISCORD_WEBHOOK_URL, {"content": "⚠️ 오늘은 새로 전할 뉴스를 수집하지 못했습니다."})
         return 1
-    send_discord(summarize(articles))
+    articles = summarize(articles)
+    briefing = make_briefing(articles, history)
+    if send_discord(articles, briefing):
+        save_history(history, articles)   # 실제로 보낸 경우에만 기록 (로컬 테스트는 기록 안 함)
     print("✅ 완료")
     return 0
 
