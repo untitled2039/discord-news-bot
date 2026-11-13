@@ -1,0 +1,47 @@
+name: Daily News Bot
+
+on:
+  schedule:
+    # 매일 08:00 KST (= 23:00 UTC 전날). GitHub cron은 UTC 기준이며 수 분 지연될 수 있음
+    - cron: "0 23 * * *"
+  workflow_dispatch:   # Actions 탭에서 수동 실행 버튼
+
+# 전송 기록(data/sent_history.json)을 저장소에 커밋하기 위한 쓰기 권한
+permissions:
+  contents: write
+
+# 수동 실행과 예약 실행이 겹쳐 기록 파일이 충돌하지 않도록 한 번에 하나만 실행
+concurrency:
+  group: daily-news
+  cancel-in-progress: false
+
+jobs:
+  send-news:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v5
+      - uses: actions/setup-python@v6
+        with:
+          python-version: "3.12"
+      - name: Run news bot
+        env:
+          DISCORD_WEBHOOK_URL: ${{ secrets.DISCORD_WEBHOOK_URL }}
+          LLM_PROVIDER: ${{ vars.LLM_PROVIDER || 'gemini' }}
+          GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
+          GEMINI_MODEL: ${{ vars.GEMINI_MODEL }}
+          OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
+          NAVER_CLIENT_ID: ${{ secrets.NAVER_CLIENT_ID }}
+          NAVER_CLIENT_SECRET: ${{ secrets.NAVER_CLIENT_SECRET }}
+          NAVER_QUERIES: ${{ vars.NAVER_QUERIES }}
+          PROMPT_MODE: ${{ vars.PROMPT_MODE }}
+          DEDUP_MODE: ${{ vars.DEDUP_MODE }}
+        run: python news_bot.py
+      - name: Save sent history
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add data/sent_history.json 2>/dev/null || exit 0
+          git diff --cached --quiet && exit 0
+          git commit -m "chore: 뉴스 전송 기록 업데이트 [skip ci]"
+          git pull --rebase && git push
