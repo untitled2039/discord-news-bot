@@ -14,14 +14,6 @@
 | 3. 기술 활용 | 텍스트 전처리·토큰화, 문장 임베딩, LLM, Few-shot 프롬프트, RAG, 워크플로 설계 | [3. 사용 기술](#3-사용-기술) |
 | 4. 구현 및 테스트 | `news_bot.py` 구현, 모의 테스트 및 실제 실행 결과 확인 | [5. 실행 결과](#5-실행-결과) |
 
-### 제출물 체크리스트
-
-- [x] 프로젝트 소스코드 — `news_bot.py`, `.github/workflows/daily-news.yml`
-- [x] README.md (프로젝트 소개, 사용 기술, 실행 방법) — 이 문서
-- [x] 시스템 처리 흐름도 — [`docs/flowchart.png`](docs/flowchart.png)
-- [ ] 실행 결과 (스크린샷 또는 시연 영상) — `docs/screenshot.png` *(실행 후 추가)*
-- [x] API Key·비밀번호 미포함 — `.env`는 `.gitignore`로 제외, 키는 GitHub Secrets로 관리
-
 ---
 
 ## 1. 주제 선정
