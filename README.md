@@ -199,6 +199,7 @@ python news_bot.py
 ![디스코드 실행 결과](docs/screenshot.png)
 
 ### 실행 로그 
+
 ⏰ [1단계] 실행 시작 2026-11-12 19:51 KST
 📥 [2단계] 뉴스 수집
 <<<<<<< HEAD
