@@ -200,9 +200,9 @@ python news_bot.py
 
 ### 실행 로그 
 
+```
 ⏰ [1단계] 실행 시작 2026-11-12 19:51 KST
 📥 [2단계] 뉴스 수집
-<<<<<<< HEAD
   · 주요뉴스: 38건
   · 경제: 35건
   · IT/과학: 34건
@@ -220,31 +220,7 @@ python news_bot.py
 📤 [4단계] 디스코드 전송
   → 1개 메시지 전송 완료
   · 전송 기록 저장: data/sent_history.json (최근 3일, 45건)
-=======
-  · 주요뉴스: 32건
-  · 경제: 51건
-  · IT/과학: 18건
-  · 세계: 29건
-  · 사회: 51건
-  → 중복 제거 후 15건 선정
-🧠 [3단계] LLM 요약 (gemini)
-  · 사용 모델: gemini-3.8-flash
-  ↻ HTTP 503, 2s 후 재시도 (1/4)
-  ↻ HTTP 503, 6s 후 재시도 (2/4)
-  ↻ HTTP 429, 16s 후 재시도 (3/4)
-  ⚠ 'gemini-3.8-flash' 응답 없음/과부하: HTTP 503 — 4회 시도 실패 (https://generativelanguage.googleapis.com/v1beta/models/gemini-3.8-flash:generateContent)
-  → 'gemini-3.5-flash-lite'(으)로 전환
-  · gemini-3.5-flash-lite 응답 2s
-  · 묶음 1/3: 5/5건 요약
-  · gemini-3.5-flash-lite 응답 3s
-  · 묶음 2/3: 5/5건 요약
-  · gemini-3.5-flash-lite 응답 2s
-  · 묶음 3/3: 5/5건 요약
-  → 15/15건 요약 완료 (최종 모델: gemini-3.5-flash-lite)
-📤 [4단계] 디스코드 전송
-  → 2개 메시지 전송 완료
->>>>>>> 9bcb5292f25e260891a9ed62304570a591377351
-✅ 완료
+```
 
 *(건수는 실행 시점에 따라 달라집니다.)*
 
